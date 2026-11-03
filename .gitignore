@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Training outputs
+checkpoints/*/
+runs/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
