@@ -1,3 +1,11 @@
+"""PPO training of W2S (Algorithm 1 of the paper).
+
+  python train.py config.yaml
+
+Each iteration rolls out a batch of training instances with the current policy, standardizes the terminal rewards,
+estimates advantages with GAE and runs several PPO epochs by replaying the recorded actions. The model is evaluated
+greedily on the validation instances and the parameters with the best validation makespan are saved.
+"""
 import torch
 import os
 import time
@@ -86,7 +94,7 @@ def evaluate(network, device, test_instances):
 
 
 def _encode(env, network, device, aug_fn=None):
-    """Encode the current state."""
+    """Encode the current state; aug_fn, if given, transforms the processing times seen by the encoder."""
     net_input = env.get_network_input()
     proc_time = net_input["proc_time"].to(device)
     if aug_fn is not None:
@@ -103,7 +111,8 @@ def _encode(env, network, device, aug_fn=None):
 
 
 def _augment_pair_feats(pair_feats, aug_fn):
-    """Apply the processing-time transform to the processing-time features of the pairs."""
+    """Apply the processing-time transform to the pair features that contain processing times
+    (6: processing time, 8: estimated completion); the environment keeps the true processing times."""
     if aug_fn is None:
         return pair_feats
     pf = pair_feats.clone()
@@ -125,6 +134,7 @@ def collect_episode(env, network, device, instances, use_proc_time_aug=True):
     n_active = torch.zeros(batch_size, device=device)
     rec_pa, rec_logp_p, rec_alive = [], [], []
 
+    # One randomly chosen order-preserving transform per rollout batch (Section 4.5.1)
     if use_proc_time_aug:
         _, aug_fn = get_random_augmentation()
     else:
@@ -137,6 +147,7 @@ def collect_episode(env, network, device, instances, use_proc_time_aug=True):
                 break
             encoded = _encode(env, network, device, aug_fn)
 
+            # Timing decision t ~ pi_T(.|s)
             cand = env.get_candidate_scheduling_times()
             ta, logp_t, _, probs_t = network.act_timing_with_probs(
                 encoded, cand, deterministic=False)
@@ -150,6 +161,7 @@ def collect_episode(env, network, device, instances, use_proc_time_aug=True):
             sel_t = cand['times'].gather(1, ta.unsqueeze(1)).squeeze(1)
             n_delay = n_delay + ((sel_t > t_min) & env.can_schedule()).float() * alive
 
+            # Pairing decision c ~ pi_P(.|s, t) among the pairs whose earliest start time equals t
             job_op_indices = env.get_job_op_indices().to(device)
             pair_feats = _augment_pair_feats(env.get_pair_private_features(sel_t).to(device), aug_fn)
             pair_mask = env._compute_pair_action_mask(sel_t).to(device)
@@ -180,7 +192,11 @@ def collect_episode(env, network, device, instances, use_proc_time_aug=True):
 
 def ppo_replay_epoch(env, network, device, instances, traj, trainer,
                      adv, v_target):
-    """One PPO epoch: replay the recorded actions, compute the PPO loss and accumulate the gradients."""
+    """One PPO epoch: replay the recorded actions, compute the PPO loss and accumulate the gradients.
+
+    The environment is deterministic, so replaying the actions reproduces the states of the rollout. The loss uses the
+    joint ratio of the timing and pairing probabilities (Eqs. (23)-(26)).
+    """
     obs, _ = env.reset(options={"instances": instances})
     batch_size = env.batch_size
     aug_fn = traj["aug_fn"]
@@ -231,7 +247,7 @@ def ppo_replay_epoch(env, network, device, instances, traj, trainer,
     return agg
 
 def train(config_path: str = "config.yaml"):
-    """Training loop."""
+    """Training loop; all settings are read from the configuration file."""
     config = load_config(config_path)
 
     if config.experiment.get("seed") is not None:
@@ -282,6 +298,7 @@ def train(config_path: str = "config.yaml"):
     config_backup_path = os.path.join(save_dir, "config.yaml")
     shutil.copy(config_path, config_backup_path)
 
+    # Generators of the training instances (distribution of Table 6)
     generators = {}
     for n_jobs, n_machines in training_sizes:
         key = (n_jobs, n_machines)
@@ -344,6 +361,7 @@ def train(config_path: str = "config.yaml"):
         device=device,
     )
 
+    # Validation instances for checkpoint selection
     test_instances = []
 
     val_subdir = train_cfg.get("val_subdir", "val_1005")
@@ -383,6 +401,7 @@ def train(config_path: str = "config.yaml"):
     for iteration in range(num_iterations):
         start_time = time.time()
 
+        # New training instances every data_refresh_interval iterations
         if iteration % data_refresh_interval == 0:
             n_jobs, n_machines = random.choice(training_sizes)
             generator = generators[(n_jobs, n_machines)]
@@ -398,11 +417,13 @@ def train(config_path: str = "config.yaml"):
             use_proc_time_aug=config.training.get("use_proc_time_aug", True))
         avg_makespan = makespans.mean().item()
 
+        # Terminal reward -C_max standardized over the batch; advantages and value targets by GAE (Eq. (24))
         reward = trainer.standardize_reward(makespans)
         adv, v_target, _ = trainer.compute_gae(v=traj["v"], alive=traj["alive"], reward=reward)
 
         last = {"pg": 0.0, "vloss": 0.0, "ent": 0.0}
         grad_norm = 0.0
+        # PPO epochs: one optimizer step per epoch after replaying the whole batch
         for _ep in range(trainer.ppo_epochs):
             trainer.zero_grad()
             last = ppo_replay_epoch(
@@ -419,6 +440,7 @@ def train(config_path: str = "config.yaml"):
         else:
             v_scale = adv_mean = adv_std = 0.0
             tgt_scale = 1.0
+        # Share of timing decisions with t > t_min, i.e. deliberate waiting
         delay_rate = (traj["n_delay"] / traj["n_active"].clamp(min=1)).mean().item()
 
         metrics = {
@@ -450,6 +472,7 @@ def train(config_path: str = "config.yaml"):
         writer.add_scalar('Critic/ValueScale', metrics['v_scale'], iteration + 1)
         writer.add_scalar('Critic/TargetScale', metrics['tgt_scale'], iteration + 1)
 
+        # Greedy validation; the parameters with the best validation makespan are saved
         test_makespan_val = None
         if test_instances and (iteration + 1) % eval_interval == 0:
             test_makespan_val = evaluate(

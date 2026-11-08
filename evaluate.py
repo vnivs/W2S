@@ -1,3 +1,12 @@
+"""Inference with a trained W2S model.
+
+  -G  greedy decoding                          --mode greedy --no_augment
+  -A  greedy decoding on 8 transformed copies    --mode greedy (default)
+  -Sk sampling of k solutions                    --mode sampling --num_samples k --no_augment
+
+The transforms change only the processing times seen by the network; every schedule is built and evaluated with the
+true processing times, and the best makespan over the copies or samples is reported.
+"""
 import torch
 import argparse
 import time
@@ -104,6 +113,7 @@ def _collect_sampling_batch(env, network, device, instance, num_samples, aug_fn=
 
 
 def evaluate_single_instance(network, instance_path, device, mode='greedy', num_samples=10, use_augment=True):
+    """Solve one instance; returns (best makespan, wall-clock time in s)."""
     start_time = time.time()
 
     instance = parse_fjsp_instance(instance_path)
@@ -123,6 +133,7 @@ def evaluate_single_instance(network, instance_path, device, mode='greedy', num_
     all_makespans = []
 
     if mode == 'greedy':
+        # One copy of the instance per transform, all decoded greedily in one batch
         network.eval()
         obs, _ = env.reset(options={"instances": [instance] * n_aug})
         with torch.no_grad():
@@ -149,6 +160,7 @@ def evaluate_single_instance(network, instance_path, device, mode='greedy', num_
         all_makespans = env.get_makespans().cpu().tolist()
 
     elif mode == 'sampling':
+        # num_samples sampled rollouts per transform
         for _, aug_fn in aug_list:
             ms_list = _collect_sampling_batch(env, network, device, instance, num_samples, aug_fn=aug_fn)
             all_makespans.extend(ms_list)
@@ -235,6 +247,7 @@ def main():
 
     print(f"Checkpoint: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    # The released checkpoints do not contain the critic, which is not needed for inference
     missing, unexpected = network.load_state_dict(checkpoint["network_state_dict"], strict=False)
     assert not unexpected and all(k.startswith("critic.") for k in missing), (missing, unexpected)
 

@@ -1,4 +1,8 @@
-"""Heterogeneous graph neural network (HGNN) encoder."""
+"""Heterogeneous graph neural network (HGNN) encoder of Section 4.4.1.
+
+The graph has operation nodes and machine nodes; operations are linked to their eligible machines (edge feature:
+processing time) and to their job predecessor and successor. Each layer first updates the machines, then the operations.
+"""
 
 import torch
 import torch.nn as nn
@@ -6,7 +10,10 @@ import torch.nn.functional as F
 
 
 class GATedge(nn.Module):
-    """Edge-aware graph attention layer that updates the machine nodes."""
+    """Edge-aware graph attention layer that updates the machine nodes (Eqs. (9)-(10)).
+
+    A machine attends to its eligible operations, with the processing time as edge feature, and to itself.
+    """
 
     def __init__(
         self,
@@ -65,6 +72,7 @@ class GATedge(nn.Module):
         ma_feats: torch.Tensor,
         proc_time: torch.Tensor,
     ) -> torch.Tensor:
+        """ope_ma_adj: [B, N_ops, M]; returns machine embeddings [B, M, out_feats]."""
         h_src = self.feat_drop(ope_feats)
         h_dst = self.feat_drop(ma_feats)
 
@@ -81,6 +89,7 @@ class GATedge(nn.Module):
 
         adj_mask = ope_ma_adj.unsqueeze(-1).unsqueeze(-1)
 
+        # Attention logits of the operation–machine edges and of the machine itself (self-loop)
         e = adj_mask * el + ee + adj_mask * er
         e = self.leaky_relu(e)
 
@@ -105,6 +114,7 @@ class GATedge(nn.Module):
         feat_dst_reshaped = feat_dst.view(*feat_dst.shape[:-1], self.num_heads, self.out_feats)
         feat_edge_reshaped = feat_edge.view(*feat_edge.shape[:-1], self.num_heads, self.out_feats)
 
+        # Messages from the operations include the processing time on the edge
         Wmu = feat_src_reshaped.unsqueeze(2) + feat_edge_reshaped
 
         neighbor_msg = (Wmu * alpha_neighbors.unsqueeze(-1)).sum(dim=1)
@@ -155,7 +165,8 @@ class MLPsim(nn.Module):
 
 
 class MLPs(nn.Module):
-    """Operation-node update."""
+    """Operation-node update (Eqs. (11)-(12)): separate MLPs aggregate the eligible machines, the job predecessor,
+    the job successor and the operation itself; the results are concatenated and projected with a residual connection."""
 
     def __init__(
         self,
@@ -197,6 +208,8 @@ class MLPs(nn.Module):
         device = ope_feats.device
 
         self_adj = torch.eye(num_opes, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Neighbourhoods: eligible machines, predecessor, successor, self
 
         h = [ma_feats, ope_feats, ope_feats, ope_feats]
         adj = [ope_ma_adj, ope_pre_adj, ope_sub_adj, self_adj]
@@ -261,6 +274,7 @@ class HGNNEncoder(nn.Module):
         ope_pre_adj: torch.Tensor,
         ope_sub_adj: torch.Tensor,
     ) -> tuple:
+        """Returns operation embeddings [B, N_ops, d_ope] and machine embeddings [B, M, d_ma]."""
         h_opes = ope_feats
         h_mas = ma_feats
 

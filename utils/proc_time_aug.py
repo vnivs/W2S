@@ -1,3 +1,9 @@
+"""Order-preserving processing-time transforms (Section 4.5.1, Table 5).
+
+Every transform is strictly increasing on the positive processing times and is mapped back to the original range, so
+the order of the processing times (e.g. the fastest machine of each operation) is kept. Zeros (non-edges) stay zero.
+The transforms are applied only to the inputs of the network, never to the environment.
+"""
 import torch
 import math
 import random

@@ -6,7 +6,12 @@ from utils.instance_parser import FJSPInstance, Job, Operation
 
 
 class FJSPGenerator:
-    """Random FJSP instance generator."""
+    """Random FJSP instance generator (training distribution of Table 6).
+
+    Every job has U(ops_per_job_min, ops_per_job_max) operations, every operation U(machines_per_op_min,
+    machines_per_op_max) eligible machines. A mean time is drawn per operation and the time on each machine is drawn
+    uniformly from [mean * (1 - proc_time_std), mean * (1 + proc_time_std)], clipped to [proc_time_min, proc_time_max].
+    """
 
     def __init__(
         self,

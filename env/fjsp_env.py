@@ -5,7 +5,15 @@ from utils.instance_parser import FJSPInstance, parse_fjsp_instance
 
 
 class FJSPEnv:
-    """Batched FJSP environment with the factorized timing–pairing action; all instances of a batch have the same size."""
+    """Batched FJSP environment with the factorized timing–pairing action; all instances of a batch have the same size.
+
+    Operations are indexed job by job (index = job * max_ops_per_job + op) and padded to max_ops_per_job per job.
+    A step appends the selected operation to the end of its machine sequence (Section 4.1 of the paper):
+      1. the timing head picks t from get_candidate_scheduling_times()  (timing action space, Eq. (4));
+      2. the pairing head picks a (job, machine) pair whose earliest start time equals t  (Eq. (6));
+      3. step() starts the operation at t on that machine.
+    The episode ends after every operation has been scheduled; the only reward is -C_max at the last step.
+    """
 
     def __init__(self, config: dict):
         self.n_jobs = config.get("n_jobs")
@@ -15,6 +23,7 @@ class FJSPEnv:
 
         self.pair_agent_id = "pair_agent"
 
+        # Static instance data (set in reset)
         self.batch_size = None
         self.job_ops_count = None
         self.op_machines_orig = None
@@ -22,17 +31,20 @@ class FJSPEnv:
         self.total_operations = None
         self.max_time_estimate = None
 
+        # Graph structure: job of every operation, predecessor / successor adjacency, valid (non-padded) operations
         self.opes_appertain = None
         self.ope_pre_adj = None
         self.ope_sub_adj = None
         self.nums_opes = None
         self.ope_valid_mask = None
 
+        # Raw node features and operation–machine edges seen by the encoder
         self.feat_opes = None
         self.feat_mas = None
         self.proc_time = None
         self.ope_ma_adj = None
 
+        # Dynamic state: next operation of every job, available times T^J (jobs) and T^M (machines)
         self.job_current_op = None
         self.machine_available_time = None
         self.machine_utiliz_time = None
@@ -47,6 +59,7 @@ class FJSPEnv:
         self.episode_done = None
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None) -> tuple:
+        """Load a batch of instances (options['instances'] or options['instance_path']) and return the initial observation."""
         if seed is not None:
             torch.manual_seed(seed)
 
@@ -212,6 +225,8 @@ class FJSPEnv:
             (op_proc_times_flat * _compat).sum(dim=(1, 2)) / _n_compat_all
         ).clamp(min=1e-6)
 
+        # Operation features (Section 4.4.1): 0 scheduled flag, 1 number of eligible machines, 2 mean processing time
+        # (actual time once scheduled), 3 start time, 4 earliest start, 5 latest start, 6 slack
         feat_opes = torch.zeros(batch_size, 7, n_ops, dtype=torch.float32, device=device)
         feat_opes[:, 0, :] = 0
         feat_opes[:, 1, :] = op_machines_flat.sum(dim=2).float()
@@ -225,6 +240,8 @@ class FJSPEnv:
         feat_opes[:, 6, :] = slack_flat
         self.feat_opes = feat_opes
 
+        # Machine features: 0 number of connected operations, 1 accumulated busy time, 2 bottleneck pressure
+        # sum(1 / flexibility), 3 utilization, 4 available time
         feat_mas = torch.zeros(batch_size, 5, n_machines, dtype=torch.float32, device=device)
         feat_mas[:, 0, :] = op_machines_flat.sum(dim=1).float()
         feat_mas[:, 1, :] = 0
@@ -235,6 +252,7 @@ class FJSPEnv:
         self.feat_mas = feat_mas
 
     def _init_state(self):
+        """Empty partial schedule: every job and machine is available at time 0."""
         batch_size = self.batch_size
         device = self.device
 
@@ -367,6 +385,11 @@ class FJSPEnv:
 
     def _execute_scheduling(self, job_ids: torch.Tensor, machine_ids: torch.Tensor,
                             start_time: torch.Tensor = None):
+        """Append the next operation of each selected job to the end of the selected machine.
+
+        The operation starts at max(t, ES), where ES = max(T^J, T^M); for a pair from the pairing action space ES = t.
+        Without a start time (non-delay variant W1S) it starts at ES. Instances that are already finished are left unchanged.
+        """
         batch_indices = torch.arange(self.batch_size, device=self.device)
         active = ~self.episode_done
 
@@ -477,6 +500,7 @@ class FJSPEnv:
         dup = (times.unsqueeze(2) == times.unsqueeze(1)).triu(diagonal=1).any(dim=1)
         cand_mask = cand_mask & (~dup)
 
+        # Jobs / machines that have a candidate pair starting at each candidate time
         ready_job = hit.any(dim=-1)
         idle_ma_mask = hit.any(dim=2)
         op_indices = torch.arange(n_jobs, device=device) * self.max_ops_per_job \
@@ -520,10 +544,11 @@ class FJSPEnv:
         n_valid = valid.sum(dim=(1, 2)).clamp(min=1).view(bs, 1).float()
         sf = torch.zeros(bs, max_cand, 9, device=device)
 
-        sf[:, :, 0] = (times - t_min) / sigma
-        sf[:, :, 1] = hit.sum(dim=(2, 3)).float() / n_valid
-        sf[:, :, 2] = ready_job.sum(dim=-1).float() / self.n_jobs
-        sf[:, :, 3] = idle_ma_mask.sum(dim=-1).float() / self.n_machines
+        # Features 1-9 of Table 3 in the paper
+        sf[:, :, 0] = (times - t_min) / sigma                                # waiting time
+        sf[:, :, 1] = hit.sum(dim=(2, 3)).float() / n_valid                   # pair ratio
+        sf[:, :, 2] = ready_job.sum(dim=-1).float() / self.n_jobs             # job ratio
+        sf[:, :, 3] = idle_ma_mask.sum(dim=-1).float() / self.n_machines      # machine ratio
 
         inf_p = torch.tensor(float('inf'), device=device)
         proc_at_t = torch.where(hit, proc.unsqueeze(1), inf_p)
@@ -536,18 +561,18 @@ class FJSPEnv:
         best_global = torch.where(torch.isinf(best_global),
                                   torch.zeros_like(best_global), best_global).view(bs, 1)
 
-        sf[:, :, 4] = best_at_t / sigma
+        sf[:, :, 4] = best_at_t / sigma                                       # best processing time
         cnt = hit.sum(dim=(2, 3)).clamp(min=1).float()
         sf[:, :, 5] = torch.where(hit, proc.unsqueeze(1), torch.zeros_like(proc).unsqueeze(1)
-                                  ).sum(dim=(2, 3)) / cnt / sigma
-        sf[:, :, 6] = (best_at_t <= best_global + 1e-6).float() * has_any.float()
-        sf[:, :, 7] = (at_min - best_at_t).clamp(min=0) / sigma
-        sf[:, :, 8] = sf[:, :, 7] - sf[:, :, 0]
+                                  ).sum(dim=(2, 3)) / cnt / sigma             # mean processing time
+        sf[:, :, 6] = (best_at_t <= best_global + 1e-6).float() * has_any.float()  # global-best indicator
+        sf[:, :, 7] = (at_min - best_at_t).clamp(min=0) / sigma              # processing-time gain over t_min
+        sf[:, :, 8] = sf[:, :, 7] - sf[:, :, 0]                               # net gain
 
         return sf * cand_mask.unsqueeze(-1).float()
 
     def get_job_op_indices(self) -> torch.Tensor:
-
+        """Index of the next operation of every job [batch, n_jobs] (last operation for finished jobs)."""
         batch_indices = torch.arange(self.batch_size, device=self.device).unsqueeze(1)
         job_indices = torch.arange(self.n_jobs, device=self.device).unsqueeze(0)
 
@@ -557,6 +582,7 @@ class FJSPEnv:
         return job_op_indices
 
     def get_network_input(self) -> Dict[str, torch.Tensor]:
+        """Graph input of the encoder (node features, processing times on the edges, adjacency, masks)."""
         return {
             "ope_feats": self.feat_opes.transpose(1, 2).clone(),
             "ma_feats": self.feat_mas.transpose(1, 2).clone(),
@@ -569,7 +595,13 @@ class FJSPEnv:
         }
 
     def get_pair_private_features(self, query_time: torch.Tensor) -> torch.Tensor:
-        """Features of every (job, machine) pair [batch, n_jobs * n_machines, 9]."""
+        """Features of every (job, machine) pair at time t [batch, n_jobs * n_machines, 9] (Table 4 of the paper).
+
+        0 remaining operations, 1 remaining mean work, 2 accumulated waiting, 3 completion ratio,
+        4 minimum processing time of the next operation, 5 number of its eligible machines,
+        6 processing time of the current operation on the machine, 7 estimated start max(T^J, T^M, t),
+        8 estimated completion.
+        """
         qt = query_time.to(self.device).float()
         bs = self.batch_size
         n_jobs = self.n_jobs
@@ -626,4 +658,5 @@ class FJSPEnv:
         return feats.view(bs, n_pairs, 9)
 
     def get_makespans(self) -> torch.Tensor:
+        """Makespan of the current (partial) schedules [batch]."""
         return torch.max(self.machine_available_time, dim=1).values

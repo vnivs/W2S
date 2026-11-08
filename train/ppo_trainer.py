@@ -7,6 +7,10 @@ from typing import Dict, Tuple
 
 
 class PPOTrainer:
+    """Holds the optimizer and computes rewards, advantages and the per-step PPO loss.
+
+    Gradients are accumulated step by step in ppo_replay_epoch (train.py) and applied by clip_and_step().
+    """
 
     def __init__(
         self,
@@ -50,6 +54,7 @@ class PPOTrainer:
         T, B = v.shape
         v = v.detach(); alive = alive.detach()
 
+        # v, alive: [T, B]; the reward is placed at the last active step of every episode
         next_alive = torch.cat([alive[1:], torch.zeros(1, B, device=v.device)], dim=0)
         is_terminal = alive * (1.0 - next_alive)
         r = is_terminal * reward.detach().unsqueeze(0)
@@ -86,7 +91,12 @@ class PPOTrainer:
         v_pred, v_target,
         active, n_dec, N,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """PPO loss of one decision step."""
+        """PPO loss of one decision step.
+
+        The ratio is computed from the joint log-probability log pi_T(t|s) + log pi_P(c|s,t), so the clipping bounds
+        the change of the complete decision (Eq. (25)). Losses are summed over the active instances and divided by N,
+        the number of active decisions of the batch.
+        """
         eps = self.clip_eps
         adv = adv.detach()
 

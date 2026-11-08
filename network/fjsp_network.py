@@ -14,7 +14,11 @@ def normalize_feats(
     ope_valid_mask: torch.Tensor,
     eps: float = 1e-5,
 ) -> tuple:
-    """Instance-wise z-score normalization of the node features and processing times."""
+    """Instance-wise z-score normalization of the node features and processing times.
+
+    Operation features are normalized over the valid operations, machine features over the machines, and processing
+    times over the existing operation–machine edges (non-edges stay 0).
+    """
     batch_size = raw_opes.size(0)
     num_opes_max = raw_opes.size(1)
     device = raw_opes.device
@@ -125,7 +129,12 @@ class PairSelfAttention(nn.Module):
 
 
 class PairAgent(nn.Module):
-    """Pairing head: pair embedding, pair self-attention and MLP scorer."""
+    """Pairing head pi_P(c|s,t) (Section 4.4.3): pair embedding, pair self-attention and MLP scorer.
+
+    A pair embedding concatenates the embedding of the next operation of the job, the machine embedding and the pair
+    features (Eq. (17)); self-attention is restricted to the feasible pairs (Eq. (18)); the scorer also sees the
+    pooled state embedding (Eq. (19)).
+    """
 
     def __init__(
         self,
@@ -167,6 +176,7 @@ class PairAgent(nn.Module):
         h_mas_pooled: torch.Tensor,
         action_mask: torch.Tensor,
     ) -> torch.Tensor:
+        """h_ops: [B, n_jobs, d] next-operation embeddings; returns pair probabilities [B, n_jobs * n_machines]."""
         B, n_jobs, _ = h_ops.shape
         n_machines = h_mas.size(1)
         n_pairs = n_jobs * n_machines
@@ -181,6 +191,7 @@ class PairAgent(nn.Module):
 
         action_mask_bool = action_mask.bool() if action_mask.dtype != torch.bool else action_mask
         key_padding_mask = ~action_mask_bool
+        # Finished instances have no feasible pair; unmask them to avoid NaNs in the attention
         all_masked = ~action_mask_bool.any(dim=-1)
         if all_masked.any():
             key_padding_mask = key_padding_mask.clone()
@@ -205,7 +216,7 @@ class PairAgent(nn.Module):
 
 
 class StateCritic(nn.Module):
-    """State-value function V(s), evaluated before the timing decision."""
+    """State-value function V(s) (Eq. (20)), evaluated before the timing decision and shared by both heads."""
 
     def __init__(self, ope_embed_dim: int, ma_embed_dim: int,
                  global_dim: int = 2, hidden_dim: int = 128,
@@ -216,13 +227,17 @@ class StateCritic(nn.Module):
 
     def forward(self, h_opes_pooled: torch.Tensor, h_mas_pooled: torch.Tensor,
                 global_feats: torch.Tensor) -> torch.Tensor:
-        """Returns V(s) [batch]。"""
+        """Returns V(s) [batch]."""
         x = torch.cat([h_opes_pooled, h_mas_pooled, global_feats], dim=-1)
         return self.net(x).squeeze(-1)
 
 
 class TimingHead(nn.Module):
-    """Timing head pi_T(t|s): selects a start time from the timing action space."""
+    """Timing head pi_T(t|s) (Section 4.4.2): selects a start time from the timing action space.
+
+    Each candidate time is represented by the mean embedding of the operations that can start at it plus its encoded
+    scalar features (Eqs. (14)-(15)); the candidates attend to each other and are scored by an MLP (Eq. (16)).
+    """
 
     def __init__(self, ope_embed_dim: int, ma_embed_dim: int,
                  scalar_feat_dim: int = 9, hidden_dim: int = 64,
@@ -280,6 +295,8 @@ class TimingHead(nn.Module):
 
         h_ops_proj = self.op_proj(h_opes)
 
+        # Masked mean over the operations that can start at each candidate time
+
         h_ops_exp = h_ops_proj.unsqueeze(1).expand(-1, C, -1, -1).reshape(B * C, N_ops, -1)
 
         ready_mask_flat = ready_op.reshape(B * C, N_ops).unsqueeze(-1).float()
@@ -334,6 +351,10 @@ class TimingHead(nn.Module):
 
 
 class FJSPNetwork(nn.Module):
+    """W2S policy: shared HGNN encoder, timing head, pairing head and critic (Fig. 5 of the paper).
+
+    Per decision step: encode() -> act_timing() -> act_pair() for the pairs that start at the chosen time.
+    """
 
     def __init__(
         self,
@@ -441,7 +462,10 @@ class FJSPNetwork(nn.Module):
         ope_sub_adj: torch.Tensor,
         ope_valid_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Normalize the features, run the HGNN encoder and pool the embeddings."""
+        """Normalize the features, run the HGNN encoder and pool the embeddings.
+
+        Returns operation / machine embeddings and the pooled state embedding [mean || max] of each (Eq. (13)).
+        """
         ope_feats, ma_feats, proc_time = normalize_feats(
             ope_feats, ma_feats, proc_time, ope_valid_mask
         )
@@ -491,7 +515,7 @@ class FJSPNetwork(nn.Module):
         pair_feats: torch.Tensor,
         action_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-
+        """Pair probabilities; pair features are standardized across the pairs of each instance."""
         h_opes = encoded["h_opes"]
         h_mas = encoded["h_mas"]
         h_opes_pooled = encoded["h_opes_pooled"]
